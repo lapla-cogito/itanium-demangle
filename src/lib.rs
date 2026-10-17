@@ -557,7 +557,7 @@ impl Demangler {
         }
         let sym = self.editable(inner);
         if sym.group != NO_DECL {
-            let at = sym.group + 1;
+            let at = find_close(&self.buf, sym.group)?;
             self.insert_at(at, token);
             return Some(shift_local(sym, at, token.len() as u32));
         }
@@ -2598,5 +2598,13 @@ mod tests {
             assert_eq!(demangler.demangle(&name), None, "{name}");
         }
         assert_eq!(demangler.demangle("_Z3foo"), Some("foo"));
+    }
+    #[test]
+    fn preserves_pointer_declarator_order() {
+        expect("_Z1fIJRPFvvEEEvv", "f<void (*&)()>");
+        expect("_Z1fIJRKPFvvEEEvv", "f<void (* const&)()>");
+        expect("_Z1fIJOPFvvEEEvv", "f<void (*&&)()>");
+        expect("_Z1fIJPPFvvEEEvv", "f<void (**)()>");
+        expect("_Z1fIJRPA3_iEEvv", "f<int (*&) [3]>");
     }
 }
