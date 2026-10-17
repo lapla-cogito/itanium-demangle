@@ -665,17 +665,11 @@ impl Demangler {
         if inner.suffix != NO_DECL || inner.group != NO_DECL {
             return None;
         }
-        if inner.cv_at != NO_DECL {
-            let sym = self.editable(inner);
-            self.insert_at(sym.cv_at, text);
-            let mut sym = shift_local(sym, sym.cv_at, text.len() as u32);
-            sym.cv_at = NO_DECL;
-            return Some(sym);
-        }
-        if inner.pops_cv {
+        if inner.cv_at != NO_DECL || inner.pops_cv {
             let sym = self.materialize_tail(inner);
             self.append(text);
             let mut sym = sym.set_end(self.buf.len() as u32);
+            sym.cv_at = NO_DECL;
             sym.pops_cv = false;
             return Some(sym);
         }
@@ -2504,26 +2498,6 @@ mod tests {
         );
         expect("_Z1fIN3Foo3BarERKS1_Ev", "f<Foo::Bar, Foo::Bar const&>");
         expect(
-            "_Z1fIN3Foo3BarENS1_3BazERKS2_Ev",
-            "f<Foo::Bar, Foo::Bar::Baz, Foo::Bar const::Baz&>",
-        );
-        expect(
-            "_Z1fIN3Foo3BarENS1_3BazERS2_Ev",
-            "f<Foo::Bar, Foo::Bar::Baz, Foo::Bar&::Baz>",
-        );
-        expect(
-            "_Z1fIN3Foo3BarENS1_3BazEPS2_Ev",
-            "f<Foo::Bar, Foo::Bar::Baz, Foo::Bar*::Baz>",
-        );
-        expect(
-            "_Z1fIN3Foo3BarENS1_3BazERVKS2_Ev",
-            "f<Foo::Bar, Foo::Bar::Baz, Foo::Bar const volatile::Baz&>",
-        );
-        expect(
-            "_Z1fIN3Foo3BarENS1_IiE3BazERKS3_Ev",
-            "f<Foo::Bar, Foo::Bar<int>::Baz, Foo::Bar const<int>::Baz&>",
-        );
-        expect(
             "_ZGVZN3Foo3barEvE3baz",
             "guard variable for Foo::bar()::baz",
         );
@@ -2617,6 +2591,33 @@ mod tests {
         expect(
             "_ZZ4exprILi2EEv1AIXplT_Li1EEEE3var",
             "expr<2>(A<(2)+(1)>)::var",
+        );
+    }
+    #[test]
+    fn qualifies_complete_nested_types() {
+        expect(
+            "_Z1fIJN3Foo3BarENS1_3BazERKS2_EEvv",
+            "f<Foo::Bar, Foo::Bar::Baz, Foo::Bar::Baz const&>",
+        );
+        expect(
+            "_Z1fIN3Foo3BarENS1_3BazERKS2_Ev",
+            "f<Foo::Bar, Foo::Bar::Baz, Foo::Bar::Baz const&>",
+        );
+        expect(
+            "_Z1fIN3Foo3BarENS1_3BazERS2_Ev",
+            "f<Foo::Bar, Foo::Bar::Baz, Foo::Bar::Baz&>",
+        );
+        expect(
+            "_Z1fIN3Foo3BarENS1_3BazEPS2_Ev",
+            "f<Foo::Bar, Foo::Bar::Baz, Foo::Bar::Baz*>",
+        );
+        expect(
+            "_Z1fIN3Foo3BarENS1_3BazERVKS2_Ev",
+            "f<Foo::Bar, Foo::Bar::Baz, Foo::Bar::Baz const volatile&>",
+        );
+        expect(
+            "_Z1fIN3Foo3BarENS1_IiE3BazERKS3_Ev",
+            "f<Foo::Bar, Foo::Bar<int>::Baz, Foo::Bar<int>::Baz const&>",
         );
     }
 }
