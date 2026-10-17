@@ -1193,11 +1193,12 @@ impl<'a> Parser<'a> {
 
     fn parse_source_name(&mut self) -> Option<Sym> {
         let len = self.parse_number()?;
-        if len == 0 || self.pos + len > self.input.len() {
+        let end = self.pos.checked_add(len)?;
+        if len == 0 || end > self.input.len() {
             return None;
         }
         let from = self.pos;
-        self.pos += len;
+        self.pos = end;
         let input = self.input;
         self.d.scratch.clear();
         self.d.scratch.extend_from_slice(&input[from..self.pos]);
@@ -2584,5 +2585,18 @@ mod tests {
             demangler.demangle("_ZTh0_1fv"),
             Some("{virtual override thunk({offset(0)}, f)}")
         );
+    }
+    #[test]
+    fn rejects_out_of_bounds_source_name_lengths() {
+        let mut demangler = Demangler::new();
+        for name in [
+            format!("_Z{}", usize::MAX),
+            format!("_Z{}x", usize::MAX - 1),
+            "_Z4foo".to_owned(),
+            "_Z0".to_owned(),
+        ] {
+            assert_eq!(demangler.demangle(&name), None, "{name}");
+        }
+        assert_eq!(demangler.demangle("_Z3foo"), Some("foo"));
     }
 }
