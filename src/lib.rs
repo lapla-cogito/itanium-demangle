@@ -1119,11 +1119,9 @@ impl<'a> Parser<'a> {
         if self.input[from..end].starts_with(b"_GLOBAL__N") {
             return Some(self.d.push_str("(anonymous namespace)"));
         }
-        let input = self.input;
-        self.d.scratch.clear();
-        self.d.scratch.extend_from_slice(&input[from..self.pos]);
-        std::str::from_utf8(&self.d.scratch).ok()?;
-        Some(self.d.append_scratch())
+        let start = self.d.buf.len() as u32;
+        self.d.buf.extend_from_slice(&self.input[from..end]);
+        Some(Sym::span(start, self.d.buf.len() as u32))
     }
 
     fn parse_encoding(&mut self) -> Option<Sym> {
@@ -1363,9 +1361,24 @@ impl<'a> Parser<'a> {
             self.pos += 1;
         }
 
+        let mut joined = false;
         let leaf = if matches!(self.peek(), Some(b'1'..=b'9')) {
+            joined = if let Some(scope) = scope {
+                !scope.side && scope.end as usize == self.d.buf.len()
+            } else {
+                false
+            };
+            if joined {
+                self.d.append(b"::");
+            }
             let name = self.parse_source_name()?;
-            self.parse_abi_tags(name)?
+            let name = self.parse_abi_tags(name)?;
+            if joined {
+                let scope = scope?;
+                name.as_name(scope.start, name.end, name.base_start, name.base_end)
+            } else {
+                name
+            }
         } else if self.starts_with(b"Ut") {
             self.pos += 2;
             let number = if matches!(self.peek(), Some(b'0'..=b'9')) {
@@ -1392,6 +1405,9 @@ impl<'a> Parser<'a> {
             return None;
         };
 
+        if joined {
+            return Some(leaf);
+        }
         Some(match scope {
             Some(scope) => self.d.qualify(scope, leaf),
             None => leaf,
@@ -2455,6 +2471,7 @@ mod tests {
         expect("_Z1fIXadL_ZN3Foo3barEiEEEv", "f<&Foo::bar(int)>");
         expect("_Z1fIXgtLi1ELi2EEEv", "f<((1)>(2))>");
         expect("_ZN3FooD0B8nn180100Ev", "Foo::~Foo[abi:nn180100]");
+        expect("_ZN3Foo3barB3abcEv", "Foo::bar[abi:abc]");
     }
 
     #[test]
