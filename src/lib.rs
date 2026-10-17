@@ -1,7 +1,7 @@
 //! A fast Itanium C++ ABI demangler.
 
 const MAX_DEPTH: u32 = 128;
-/// Absent `Sym::suffix`, `Sym::group`, or `Sym::cv_at`.
+/// Absent `Sym::suffix` or `Sym::group`.
 const NO_DECL: u32 = u32::MAX;
 
 #[derive(Debug)]
@@ -50,12 +50,6 @@ struct Sym {
     suffix: u32,
     /// `'('` of a pointer or reference group. [`NO_DECL`] if there is none.
     group: u32,
-    /// `::` that absorbs a qualifier. [`NO_DECL`] appends the qualifier instead.
-    ///
-    /// Set when this name's prefix is a substituted nested-name type.
-    cv_at: u32,
-    /// This name consumes one qualifier after `cv_at`.
-    pops_cv: bool,
     ends_with_template: bool,
     /// Constructor, destructor, or conversion operator. No return type follows.
     is_ctor: bool,
@@ -77,8 +71,6 @@ impl Sym {
             base_end: end,
             suffix: NO_DECL,
             group: NO_DECL,
-            cv_at: NO_DECL,
-            pops_cv: false,
             ends_with_template: false,
             is_ctor: false,
             cv_const: false,
@@ -110,7 +102,6 @@ impl Sym {
             base_end: shift(self.base_end),
             suffix: shift(self.suffix),
             group: shift(self.group),
-            cv_at: shift(self.cv_at),
             ..self
         }
     }
@@ -131,28 +122,6 @@ impl Sym {
 
     fn with_template(mut self) -> Self {
         self.ends_with_template = true;
-        self
-    }
-
-    fn with_joined_cv(mut self, cv_at: u32) -> Self {
-        self.cv_at = cv_at;
-        self.pops_cv = false;
-        self
-    }
-
-    fn with_template_cv(mut self, name: Sym, lt_at: u32) -> Self {
-        if name.cv_at != NO_DECL {
-            let new_start = self.start;
-            self.cv_at = if new_start == name.start {
-                name.cv_at
-            } else {
-                new_start + (name.cv_at - name.start)
-            };
-        } else if name.pops_cv {
-            self.cv_at = lt_at;
-        }
-        // The argument list itself does not consume a qualifier.
-        self.pops_cv = false;
         self
     }
 
@@ -352,20 +321,17 @@ impl Demangler {
 
     fn qualify(&mut self, scope: Sym, leaf: Sym) -> Sym {
         if scope.end == leaf.start {
-            let colon_at = leaf.start;
             self.insert_at(leaf.start, b"::");
             let base_off = leaf.base_start - leaf.start;
             let base_len = leaf.base_end - leaf.base_start;
             let text_len = leaf.end - leaf.start;
             let leaf_start = leaf.start + 2;
-            return leaf
-                .as_name(
-                    scope.start,
-                    leaf_start + text_len,
-                    leaf_start + base_off,
-                    leaf_start + base_off + base_len,
-                )
-                .with_joined_cv(cv_join(scope, colon_at, None));
+            return leaf.as_name(
+                scope.start,
+                leaf_start + text_len,
+                leaf_start + base_off,
+                leaf_start + base_off + base_len,
+            );
         }
         // The leaf is already the tail. Rewrite that tail as `scope::leaf`.
         if leaf.end as usize == self.buf.len() {
@@ -380,14 +346,12 @@ impl Demangler {
             self.append_range(scope);
             self.append(b"::");
             self.append_scratch();
-            return leaf
-                .as_name(
-                    start,
-                    self.buf.len() as u32,
-                    start + scope_len + 2 + base_off,
-                    start + scope_len + 2 + base_off + base_len,
-                )
-                .with_joined_cv(cv_join(scope, start + scope_len, Some(start)));
+            return leaf.as_name(
+                start,
+                self.buf.len() as u32,
+                start + scope_len + 2 + base_off,
+                start + scope_len + 2 + base_off + base_len,
+            );
         }
         let start = self.buf.len() as u32;
         let scope_len = scope.end - scope.start;
@@ -402,7 +366,6 @@ impl Demangler {
             start + scope_len + 2 + base_off,
             start + scope_len + 2 + base_off + base_len,
         )
-        .with_joined_cv(cv_join(scope, start + scope_len, Some(start)))
     }
 
     fn qualify_ctor(&mut self, scope: Sym, destructor: bool) -> Sym {
@@ -415,14 +378,12 @@ impl Demangler {
         }
         self.append_base(scope);
         let end = self.buf.len() as u32;
-        let scope_len = scope.end - scope.start;
         Sym {
             start,
             end,
             base_start,
             base_end: end,
             is_ctor: true,
-            cv_at: cv_join(scope, start + scope_len, Some(start)),
             ..Sym::span(start, end)
         }
     }
@@ -433,13 +394,11 @@ impl Demangler {
                 self.insert_at(args_start, b" ");
                 return name
                     .as_name(name.start, args_end + 1, name.base_start, name.base_end)
-                    .with_template()
-                    .with_template_cv(name, args_start + 1);
+                    .with_template();
             }
             return name
                 .as_name(name.start, args_end, name.base_start, name.base_end)
-                .with_template()
-                .with_template_cv(name, args_start);
+                .with_template();
         }
         // Arguments were written at the tail. Move them to after `name`.
         self.scratch.clear();
@@ -466,7 +425,6 @@ impl Demangler {
             start + base_off + base_len,
         )
         .with_template()
-        .with_template_cv(name, new_args_start)
     }
 
     fn format_params(&mut self, name: Sym, params: &[Sym]) -> Sym {
@@ -497,9 +455,6 @@ impl Demangler {
             start + base_off + base_len,
         );
         sym.ends_with_template = false;
-        // A function encoding is not a nested-name type.
-        sym.pops_cv = false;
-        sym.cv_at = NO_DECL;
         self.apply_name_qualifiers(sym)
     }
 
@@ -547,9 +502,6 @@ impl Demangler {
             b'O' => b"&&",
             _ => return None,
         };
-        if let Some(sym) = self.take_pop_slot(inner, token) {
-            return Some(sym);
-        }
         if inner.suffix == NO_DECL {
             let sym = self.materialize_tail(inner);
             self.append(token);
@@ -579,7 +531,7 @@ impl Demangler {
 
     /// `None` when `inner` is not a reference, so the caller appends one.
     fn collapse_ref(&mut self, inner: Sym, rvalue: bool) -> Option<Sym> {
-        if inner.suffix != NO_DECL || inner.group != NO_DECL || inner.cv_at != NO_DECL {
+        if inner.suffix != NO_DECL || inner.group != NO_DECL {
             return None;
         }
         let bytes = self.sym_bytes(inner);
@@ -601,9 +553,6 @@ impl Demangler {
     }
 
     fn wrap_cv(&mut self, inner: Sym, text: &str) -> Option<Sym> {
-        if let Some(sym) = self.take_pop_slot(inner, text.as_bytes()) {
-            return Some(sym);
-        }
         let editing = inner.group != NO_DECL
             || (inner.suffix != NO_DECL
                 && self
@@ -658,22 +607,6 @@ impl Demangler {
         }
         self.append(&token);
         Some(member.set_end(self.buf.len() as u32))
-    }
-
-    /// `None` when a declarator chooses the qualifier position instead.
-    fn take_pop_slot(&mut self, inner: Sym, text: &[u8]) -> Option<Sym> {
-        if inner.suffix != NO_DECL || inner.group != NO_DECL {
-            return None;
-        }
-        if inner.cv_at != NO_DECL || inner.pops_cv {
-            let sym = self.materialize_tail(inner);
-            self.append(text);
-            let mut sym = sym.set_end(self.buf.len() as u32);
-            sym.cv_at = NO_DECL;
-            sym.pops_cv = false;
-            return Some(sym);
-        }
-        None
     }
 
     fn wrap_array(&mut self, elem: Sym, dim: Option<usize>) -> Option<Sym> {
@@ -924,21 +857,6 @@ fn shift_sym(sym: &mut Sym, pos: u32, amount: u32) {
     shift_range(&mut sym.base_start, &mut sym.base_end, pos, amount);
     shift_index(&mut sym.suffix, pos, amount);
     shift_index(&mut sym.group, pos, amount);
-    shift_index(&mut sym.cv_at, pos, amount);
-}
-
-/// `moved_to` is the scope's new start when `qualify` copied it. `None` means it stayed put.
-fn cv_join(scope: Sym, colon_at: u32, moved_to: Option<u32>) -> u32 {
-    if scope.cv_at != NO_DECL {
-        match moved_to {
-            Some(new_start) => new_start + (scope.cv_at - scope.start),
-            None => scope.cv_at,
-        }
-    } else if scope.pops_cv {
-        colon_at
-    } else {
-        NO_DECL
-    }
 }
 
 fn shift_index(idx: &mut u32, pos: u32, amount: u32) {
@@ -1421,8 +1339,6 @@ impl<'a> Parser<'a> {
             self.d.subs.pop()?;
         }
         let mut name = so_far?;
-        // The whole nested name consumes a qualifier. The prefixes pushed above do not.
-        name.pops_cv = true;
         name.cv_const = cv_const;
         name.cv_volatile = cv_volatile;
         name.cv_restrict = cv_restrict;
@@ -2219,7 +2135,6 @@ impl<'a> Parser<'a> {
         }
         self.d.append(b" (");
         let suffix = self.d.buf.len() as u32 - 1;
-        let mut stolen = None;
         if self.peek() == Some(b'v') && self.peek_at(1) == Some(b'E') {
             self.pos += 1;
         } else {
@@ -2234,10 +2149,7 @@ impl<'a> Parser<'a> {
                 first = false;
                 let cursor = self.d.buf.len() as u32;
                 let param = self.parse_type()?;
-                let param = self.d.place_at_cursor(param, cursor)?;
-                if stolen.is_none() && param.pops_cv {
-                    stolen = Some(param);
-                }
+                self.d.place_at_cursor(param, cursor)?;
             }
         }
         let ref_qual = if self.peek() == Some(b'R') && self.peek_at(1) == Some(b'E') {
@@ -2250,48 +2162,20 @@ impl<'a> Parser<'a> {
             0
         };
         self.eat(b'E')?;
-        let has_qual = const_qual || volatile_qual || restrict_qual || ref_qual != 0;
-        // A nested-name parameter consumes this function's cv-qualifiers.
-        let stolen = if has_qual { stolen } else { None };
-        if let Some(param) = stolen {
-            let mut qual = String::new();
-            if const_qual {
-                qual.push_str(" const");
-            }
-            if volatile_qual {
-                qual.push_str(" volatile");
-            }
-            if restrict_qual {
-                qual.push_str(" restrict");
-            }
-            match ref_qual {
-                1 => qual.push_str(" &"),
-                2 => qual.push_str(" &&"),
-                _ => {}
-            }
-            let at = if param.cv_at != NO_DECL {
-                param.cv_at
-            } else {
-                param.end
-            };
-            self.d.insert_at(at, qual.as_bytes());
-        }
         self.d.append(b")");
-        if stolen.is_none() {
-            if const_qual {
-                self.d.append(b" const");
-            }
-            if volatile_qual {
-                self.d.append(b" volatile");
-            }
-            if restrict_qual {
-                self.d.append(b" restrict");
-            }
-            match ref_qual {
-                1 => self.d.append(b" &"),
-                2 => self.d.append(b" &&"),
-                _ => {}
-            }
+        if const_qual {
+            self.d.append(b" const");
+        }
+        if volatile_qual {
+            self.d.append(b" volatile");
+        }
+        if restrict_qual {
+            self.d.append(b" restrict");
+        }
+        match ref_qual {
+            1 => self.d.append(b" &"),
+            2 => self.d.append(b" &&"),
+            _ => {}
         }
         let mut sym = Sym::span(ret.start, self.d.buf.len() as u32);
         sym.suffix = suffix;
@@ -2517,7 +2401,7 @@ mod tests {
         expect("_Z1fIM3FooiE", "f<int Foo::*>");
         expect(
             "_ZTIMN4llvm4json6ObjectEKFSt8optionalINS_9StringRefEES3_E",
-            "typeinfo for std::optional<llvm::StringRef> (llvm::json::Object::*)(llvm::StringRef const)",
+            "typeinfo for std::optional<llvm::StringRef> (llvm::json::Object::*)(llvm::StringRef) const",
         );
         expect("_Z1fIXadL_ZN3Foo3barEiEEEv", "f<&Foo::bar(int)>");
         expect("_Z1fIXgtLi1ELi2EEEv", "f<((1)>(2))>");
@@ -2618,6 +2502,21 @@ mod tests {
         expect(
             "_Z1fIN3Foo3BarENS1_IiE3BazERKS3_Ev",
             "f<Foo::Bar, Foo::Bar<int>::Baz, Foo::Bar<int>::Baz const&>",
+        );
+    }
+    #[test]
+    fn keeps_qualifiers_on_member_function_types() {
+        expect("_Z1fIJM1DKFvN1N1TEEEEvv", "f<void (D::*)(N::T) const>");
+        expect("_Z1fIJM1DVFvN1N1TEEEEvv", "f<void (D::*)(N::T) volatile>");
+        expect(
+            "_Z1fIJM1DVKFvN1N1TEEEEvv",
+            "f<void (D::*)(N::T) const volatile>",
+        );
+        expect("_Z1fIJM1DFvN1N1TEREEEvv", "f<void (D::*)(N::T) &>");
+        expect("_Z1fIJM1DKFvN1N1TEOEEEvv", "f<void (D::*)(N::T) const &&>");
+        expect(
+            "_Z1fIJM1DKFvKN1N1TEEEEvv",
+            "f<void (D::*)(N::T const) const>",
         );
     }
 }
