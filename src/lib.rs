@@ -2086,12 +2086,10 @@ impl<'a> Parser<'a> {
         }
         if self.starts_with(b"li") {
             self.pos += 2;
-            let name = self.parse_source_name()?;
-            let name = self.d.materialize_tail(name);
-            self.d.insert_at(name.start, b"operator");
-            self.d.append(b"::operator \"\"");
-            let sym = shift_local(name, name.start, "operator".len() as u32);
-            return Some(sym.set_end(self.d.buf.len() as u32));
+            let start = self.d.buf.len() as u32;
+            self.d.append(b"operator\"\" ");
+            self.parse_source_name()?;
+            return Some(Sym::span(start, self.d.buf.len() as u32));
         }
         let symbol = operator_symbol(self.peek()?, self.peek_at(1)?)?;
         self.pos += 2;
@@ -2517,6 +2515,15 @@ mod tests {
         expect(
             "_Z1fIJM1DKFvKN1N1TEEEEvv",
             "f<void (D::*)(N::T const) const>",
+        );
+    }
+    #[test]
+    fn preserves_literal_operator_names() {
+        expect("_Zli4_fooe", "operator\"\" _foo");
+        expect("_ZN1Nli4_fooEe", "N::operator\"\" _foo");
+        expect(
+            "_Zli4_numIJLc49ELc50EEEiv",
+            "operator\"\" _num<(char)49, (char)50>",
         );
     }
 }
