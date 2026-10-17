@@ -536,10 +536,10 @@ impl Demangler {
 
     /// `'*'`, `'&'`, or `'O'` for `&&`.
     fn wrap_pointer(&mut self, inner: Sym, kind: u8) -> Option<Sym> {
-        if kind != b'*' {
-            if let Some(collapsed) = self.collapse_ref(inner, kind == b'O') {
-                return Some(collapsed);
-            }
+        if kind != b'*'
+            && let Some(collapsed) = self.collapse_ref(inner, kind == b'O')
+        {
+            return Some(collapsed);
         }
         let token: &[u8] = match kind {
             b'*' => b"*",
