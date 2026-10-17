@@ -1570,6 +1570,13 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_arg_pack(&mut self) -> Option<Sym> {
+        self.enter()?;
+        let parsed = self.parse_arg_pack_inner();
+        self.leave();
+        parsed
+    }
+
+    fn parse_arg_pack_inner(&mut self) -> Option<Sym> {
         self.eat(b'J')?;
         let start = self.d.buf.len() as u32;
         let saved = self.d.in_arg_pack;
@@ -2096,6 +2103,13 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_thunk(&mut self, covariant: bool) -> Option<Sym> {
+        self.enter()?;
+        let parsed = self.parse_thunk_inner(covariant);
+        self.leave();
+        parsed
+    }
+
+    fn parse_thunk_inner(&mut self, covariant: bool) -> Option<Sym> {
         let start = self.d.buf.len() as u32;
         self.d.append(b"{virtual override thunk(");
         self.parse_call_offset()?;
@@ -2551,5 +2565,24 @@ mod tests {
         assert_eq!(demangle_owned("malloc"), None);
         assert_eq!(demangle_owned("_RNvC3foo3bar"), None);
         assert_eq!(demangle_owned("_ZN3Foov1abcE"), None);
+    }
+    #[test]
+    fn limits_argument_pack_depth() {
+        let mut demangler = Demangler::new();
+        let depth = super::MAX_DEPTH as usize * 2;
+        let name = format!("_Z1fI{}i{}Evv", "J".repeat(depth), "E".repeat(depth));
+        assert!(demangler.demangle(&name).is_none());
+        assert_eq!(demangler.demangle("_Z1fIJiEEvv"), Some("f<int>"));
+    }
+
+    #[test]
+    fn limits_thunk_depth() {
+        let mut demangler = Demangler::new();
+        let name = format!("_Z{}1fv", "Th0_".repeat(super::MAX_DEPTH as usize * 2));
+        assert!(demangler.demangle(&name).is_none());
+        assert_eq!(
+            demangler.demangle("_ZTh0_1fv"),
+            Some("{virtual override thunk({offset(0)}, f)}")
+        );
     }
 }
