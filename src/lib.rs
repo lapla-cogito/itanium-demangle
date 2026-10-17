@@ -2443,7 +2443,9 @@ impl<'a> Parser<'a> {
         let sym = self.d.editable(expr.sym);
         self.d.insert_at(sym.start, b"(");
         self.d.append(b")");
-        shift_local(sym, sym.start, 1).set_end(self.d.buf.len() as u32)
+        let mut sym = shift_local(sym, sym.start, 1);
+        sym.start -= 1;
+        sym.set_end(self.d.buf.len() as u32)
     }
 }
 
@@ -2606,5 +2608,15 @@ mod tests {
         expect("_Z1fIJOPFvvEEEvv", "f<void (*&&)()>");
         expect("_Z1fIJPPFvvEEEvv", "f<void (**)()>");
         expect("_Z1fIJRPA3_iEEvv", "f<int (*&) [3]>");
+    }
+    #[test]
+    fn preserves_expression_parentheses() {
+        expect("_Z1fIXplLi1ELi2EEEvv", "f<(1)+(2)>");
+        expect("_Z1fIXngLi1EEEvv", "f<-(1)>");
+        expect("_Z1fIXmlplLi1ELi2ELi3EEEvv", "f<((1)+(2))*(3)>");
+        expect(
+            "_ZZ4exprILi2EEv1AIXplT_Li1EEEE3var",
+            "expr<2>(A<(2)+(1)>)::var",
+        );
     }
 }
