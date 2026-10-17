@@ -18,6 +18,8 @@ pub struct Demangler {
     depth: u32,
     /// Inside `J...E`, so a pack expansion does not print another `...`.
     in_arg_pack: bool,
+    /// Inside a lambda signature. `T_` there is that lambda's `auto`.
+    in_lambda_sig: bool,
     /// Local names and expression literals print parameter lists.
     show_params: bool,
     /// `parse_type` depth. A type's template arguments do not open a scope.
@@ -151,6 +153,7 @@ impl Demangler {
             template_levels: 0,
             depth: 0,
             in_arg_pack: false,
+            in_lambda_sig: false,
             show_params: false,
             defer_depth: 0,
             type_depth: 0,
@@ -167,6 +170,7 @@ impl Demangler {
         self.template_levels = 0;
         self.depth = 0;
         self.in_arg_pack = false;
+        self.in_lambda_sig = false;
         self.show_params = false;
         self.defer_depth = 0;
         self.type_depth = 0;
@@ -1524,6 +1528,29 @@ impl<'a> Parser<'a> {
         self.d.append(b"{lambda(");
         let saved_depth = self.d.defer_depth;
         self.d.defer_depth = 0;
+        let saved_lambda = self.d.in_lambda_sig;
+        self.d.in_lambda_sig = true;
+        let params = self.parse_lambda_params();
+        self.d.in_lambda_sig = saved_lambda;
+        self.d.defer_depth = saved_depth;
+        params?;
+        let number = if matches!(self.peek(), Some(b'0'..=b'9')) {
+            Some(self.parse_number()?)
+        } else {
+            None
+        };
+        self.eat(b'_')?;
+        // `Ul...E_` is closure #1. An explicit number is that value plus two.
+        let index = match number {
+            None => 1,
+            Some(number) => number.checked_add(2)?,
+        };
+        let suffix = format!(")#{index}}}");
+        self.d.append(suffix.as_bytes());
+        Some(Sym::span(start, self.d.buf.len() as u32))
+    }
+
+    fn parse_lambda_params(&mut self) -> Option<()> {
         if self.peek() == Some(b'v') && self.peek_at(1) == Some(b'E') {
             self.pos += 1;
         } else {
@@ -1539,21 +1566,7 @@ impl<'a> Parser<'a> {
             }
         }
         self.eat(b'E')?;
-        self.d.defer_depth = saved_depth;
-        let number = if matches!(self.peek(), Some(b'0'..=b'9')) {
-            Some(self.parse_number()?)
-        } else {
-            None
-        };
-        self.eat(b'_')?;
-        // `Ul...E_` is closure #1. An explicit number is that value plus two.
-        let index = match number {
-            None => 1,
-            Some(number) => number.checked_add(2)?,
-        };
-        let suffix = format!(")#{index}}}");
-        self.d.append(suffix.as_bytes());
-        Some(Sym::span(start, self.d.buf.len() as u32))
+        Some(())
     }
 
     fn at_encoding_end(&self) -> bool {
@@ -1697,6 +1710,10 @@ impl<'a> Parser<'a> {
             self.eat(b'_')?;
             index
         };
+        // Itanium mangles `auto` in a lambda parameter list as a template parameter.
+        if self.d.in_lambda_sig {
+            return Some(self.d.push_str("auto"));
+        }
         self.d.template_arg(index)
     }
 
@@ -2375,6 +2392,26 @@ mod tests {
         expect("_ZZN3FooC1EDnE3bar", "Foo::Foo(std::nullptr_t)::bar");
         expect("_ZN3FooUlvE_3barEv", "Foo::{lambda()#1}::bar");
         expect("_ZN3FooUlvE_clEv", "Foo::{lambda()#1}::operator()");
+        expect("_ZN3FooUlT_E_clEi", "Foo::{lambda(auto)#1}::operator()");
+        expect(
+            "_ZN3FooUlT_T0_E_clEii",
+            "Foo::{lambda(auto, auto)#1}::operator()",
+        );
+        expect("_ZN3FooUlPT_E_clEPi", "Foo::{lambda(auto*)#1}::operator()");
+        expect(
+            "_ZN3FooUlRKT_E_clERKi",
+            "Foo::{lambda(auto const&)#1}::operator()",
+        );
+        expect(
+            "_ZN3FooUlSt6vectorIT_EE_clEv",
+            "Foo::{lambda(std::vector<auto>)#1}::operator()",
+        );
+        expect("_ZN3Foo3barIiEUlT_E_Ev", "Foo::bar<int>::{lambda(auto)#1}");
+        expect(
+            "_ZZN3Foo3barEvENUlT_E_4callEv",
+            "Foo::bar()::{lambda(auto)#1}::call",
+        );
+        expect("_ZZN3Foo3barIiE3bazET_E1x", "Foo::bar<int>::baz(int)::x");
         expect("_ZN3FooaSERS_", "Foo::operator=");
         expect("_ZN3FoonwEm", "Foo::operator new");
         expect("_ZN3FoocviEv", "Foo::operator int");
