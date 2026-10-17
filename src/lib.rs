@@ -1111,6 +1111,10 @@ impl<'a> Parser<'a> {
         }
         let from = self.pos;
         self.pos = end;
+        // GCC emits `_GLOBAL__N_…` as the source name of an anonymous namespace.
+        if self.input[from..end].starts_with(b"_GLOBAL__N") {
+            return Some(self.d.push_str("(anonymous namespace)"));
+        }
         let input = self.input;
         self.d.scratch.clear();
         self.d.scratch.extend_from_slice(&input[from..self.pos]);
@@ -2343,6 +2347,16 @@ mod tests {
         expect("_ZN3Foo3barEv", "Foo::bar");
         expect("_ZN3Foo5valueE", "Foo::value");
         expect("_Z3foov", "foo");
+        expect("_Z12_GLOBAL__N_1", "(anonymous namespace)");
+        expect("_ZN12_GLOBAL__N_13fooEv", "(anonymous namespace)::foo");
+        expect(
+            "_ZN3Foo12_GLOBAL__N_13barEv",
+            "Foo::(anonymous namespace)::bar",
+        );
+        expect(
+            "_ZN12_GLOBAL__N_112_GLOBAL__N_11xEv",
+            "(anonymous namespace)::(anonymous namespace)::x",
+        );
         expect("_ZTVN3Foo3BarE", "{vtable(Foo::Bar)}");
         expect("_ZN3FooIiLm4EE3barEv", "Foo<int, (unsigned long)4>::bar");
         expect(
