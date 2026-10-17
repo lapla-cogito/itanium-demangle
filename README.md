@@ -25,8 +25,8 @@ One `Demangler` is reused for every name. `cpp_demangle` 0.5.1 is called with `n
 
 | | Median (whole list) | Per name |
 | --- | ---: | ---: |
-| `itanium-demangle` | 12.0 ms | 244 ns |
-| `cpp_demangle` 0.5.1 | 88.1 ms | 1.79 µs |
+| `itanium-demangle` | 9.2 ms | 187 ns |
+| `cpp_demangle` 0.5.1 | 77.2 ms | 1.57 µs |
 
 
 [Itanium C++ ABI]: https://itanium-cxx-abi.github.io/cxx-abi/abi.html#mangling
