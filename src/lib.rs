@@ -42,6 +42,72 @@ thread_local! {
     static DEM: std::cell::RefCell<Demangler> = std::cell::RefCell::new(Demangler::new());
 }
 
+fn is_rust_legacy_symbol(mut symbol: &str) -> bool {
+    let llvm = ".llvm.";
+    if let Some(i) = symbol.find(llvm) {
+        let candidate = &symbol[i + llvm.len()..];
+        if candidate
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'A'..=b'F' | b'@'))
+        {
+            symbol = &symbol[..i];
+        }
+    }
+    let inner = if let Some(rest) = symbol.strip_prefix("_ZN") {
+        rest
+    } else if let Some(rest) = symbol.strip_prefix("ZN") {
+        rest
+    } else if let Some(rest) = symbol.strip_prefix("__ZN") {
+        rest
+    } else {
+        return false;
+    };
+    if inner.bytes().any(|byte| byte & 0x80 != 0) {
+        return false;
+    }
+    let bytes = inner.as_bytes();
+    let Some(mut current) = bytes.first().copied() else {
+        return false;
+    };
+    let mut pos = 1;
+    while current != b'E' {
+        if !current.is_ascii_digit() {
+            return false;
+        }
+        let mut len = 0usize;
+        while current.is_ascii_digit() {
+            let Some(next) = len
+                .checked_mul(10)
+                .and_then(|len| len.checked_add((current - b'0') as usize))
+            else {
+                return false;
+            };
+            len = next;
+            let Some(next) = bytes.get(pos).copied() else {
+                return false;
+            };
+            current = next;
+            pos += 1;
+        }
+        for _ in 0..len {
+            let Some(next) = bytes.get(pos).copied() else {
+                return false;
+            };
+            current = next;
+            pos += 1;
+        }
+    }
+    let Some(suffix) = bytes.get(pos..) else {
+        return false;
+    };
+    suffix.is_empty() || (suffix[0] == b'.' && suffix.iter().copied().all(is_symbol_byte))
+}
+
+fn is_symbol_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(byte, 0x21..=0x2F | 0x3A..=0x40 | 0x5B..=0x60 | 0x7B..=0x7E)
+}
+
 #[derive(Clone, Copy, Debug)]
 struct Sym {
     start: u32,
@@ -164,6 +230,9 @@ impl Demangler {
     ///
     /// The returned string is invalid after the next call.
     pub fn demangle<'a>(&'a mut self, symbol: &'a str) -> Option<&'a str> {
+        if is_rust_legacy_symbol(symbol) {
+            return None;
+        }
         self.buf.clear();
         self.side.clear();
         self.subs.clear();
@@ -2378,7 +2447,6 @@ mod tests {
     #[test]
     fn demangles() {
         expect("_ZN3Foo3barEv", "Foo::bar");
-        expect("_ZN3Foo5valueE", "Foo::value");
         expect("_Z3foov", "foo");
         expect("_Z12_GLOBAL__N_1", "(anonymous namespace)");
         expect("_ZN12_GLOBAL__N_13fooEv", "(anonymous namespace)::foo");
@@ -2478,9 +2546,9 @@ mod tests {
     fn reuses_its_buffers() {
         let mut demangler = Demangler::new();
         let first = demangler.demangle("_ZN3Foo3barEv").unwrap().to_string();
-        let second = demangler.demangle("_ZN3Foo5valueE").unwrap().to_string();
+        let second = demangler.demangle("_ZN3FooC1Ev").unwrap().to_string();
         assert_eq!(first, "Foo::bar");
-        assert_eq!(second, "Foo::value");
+        assert_eq!(second, "Foo::Foo");
         assert_eq!(
             demangler.demangle("_ZNSt6vectorIS_IiEE4sizeEv"),
             Some("std::vector<std::vector<int> >::size")
@@ -2492,6 +2560,12 @@ mod tests {
         assert_eq!(demangle_owned("malloc"), None);
         assert_eq!(demangle_owned("_RNvC3foo3bar"), None);
         assert_eq!(demangle_owned("_ZN3Foov1abcE"), None);
+        assert_eq!(demangle_owned("_ZN3Foo5valueE"), None);
+        assert_eq!(demangle_owned("_ZN13_$LT$test$GT$E"), None);
+        assert_eq!(demangle_owned("_ZN3foo3bar17h0123456789abcdefE"), None);
+        assert_eq!(demangle_owned("_ZN3foo3barE.llvm.1234"), None);
+        assert_eq!(demangle_owned("__ZN3foo3barE"), None);
+        assert_eq!(demangle_owned("ZN3foo3barE"), None);
     }
     #[test]
     fn limits_argument_pack_depth() {
