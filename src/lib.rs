@@ -26,6 +26,15 @@ pub struct Demangler {
     type_depth: u32,
     /// Cv-qualifiers still to print after a parameter list.
     defer_depth: u32,
+    /// Top-level encoding is `N` and every component so far is a plain source name.
+    ///
+    /// Rust legacy names have that shape. Tracking it here avoids a second scan of the
+    /// unparsed parameter types.
+    legacy_plain: bool,
+    /// One of those source names contains `.llvm.`. The legacy scan can then truncate.
+    legacy_llvm_in_name: bool,
+    /// One of those source names contains a non-ASCII byte. Those names are not legacy Rust.
+    legacy_high_bit: bool,
 }
 
 /// Demangle one symbol with a thread-local [`Demangler`].
@@ -106,6 +115,21 @@ fn is_rust_legacy_symbol(mut symbol: &str) -> bool {
 fn is_symbol_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric()
         || matches!(byte, 0x21..=0x2F | 0x3A..=0x40 | 0x5B..=0x60 | 0x7B..=0x7E)
+}
+
+fn suffix_is_legacy(suffix: &[u8]) -> bool {
+    match suffix.first().copied() {
+        None => true,
+        Some(b'.') => suffix.iter().copied().all(is_symbol_byte),
+        Some(_) => false,
+    }
+}
+
+fn rejects_rust_legacy(symbol: &str, suffix: &[u8], llvm_in_name: bool, high_bit: bool) -> bool {
+    if llvm_in_name {
+        return is_rust_legacy_symbol(symbol);
+    }
+    !high_bit && suffix_is_legacy(suffix)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -223,6 +247,9 @@ impl Demangler {
             show_params: false,
             defer_depth: 0,
             type_depth: 0,
+            legacy_plain: false,
+            legacy_llvm_in_name: false,
+            legacy_high_bit: false,
         }
     }
 
@@ -230,9 +257,6 @@ impl Demangler {
     ///
     /// The returned string is invalid after the next call.
     pub fn demangle<'a>(&'a mut self, symbol: &'a str) -> Option<&'a str> {
-        if is_rust_legacy_symbol(symbol) {
-            return None;
-        }
         self.buf.clear();
         self.side.clear();
         self.subs.clear();
@@ -243,6 +267,9 @@ impl Demangler {
         self.show_params = false;
         self.defer_depth = 0;
         self.type_depth = 0;
+        self.legacy_plain = false;
+        self.legacy_llvm_in_name = false;
+        self.legacy_high_bit = false;
 
         let input = symbol.as_bytes();
         let pos = if input.starts_with(b"_Z") {
@@ -252,6 +279,8 @@ impl Demangler {
         } else {
             return None;
         };
+        // Only a top-level nested name can be a Rust legacy symbol.
+        self.legacy_plain = input.get(pos) == Some(&b'N');
 
         let mut parser = Parser {
             d: self,
@@ -259,6 +288,14 @@ impl Demangler {
             pos,
         };
         let mut sym = parser.parse_encoding()?;
+        let end_pos = parser.pos;
+        let legacy_plain = parser.d.legacy_plain;
+        let legacy_llvm = parser.d.legacy_llvm_in_name;
+        let legacy_high = parser.d.legacy_high_bit;
+        if legacy_plain && rejects_rust_legacy(symbol, &input[end_pos..], legacy_llvm, legacy_high)
+        {
+            return None;
+        }
         if parser.peek() == Some(b'.') {
             sym = parser.d.materialize_tail(sym);
             parser.d.append(&parser.input[parser.pos..]);
@@ -1184,12 +1221,21 @@ impl<'a> Parser<'a> {
         }
         let from = self.pos;
         self.pos = end;
+        let ident = &self.input[from..end];
+        if self.d.legacy_plain {
+            if ident.iter().any(|byte| byte & 0x80 != 0) {
+                self.d.legacy_high_bit = true;
+            }
+            if ident.len() >= 6 && ident.windows(6).any(|window| window == b".llvm.") {
+                self.d.legacy_llvm_in_name = true;
+            }
+        }
         // GCC emits `_GLOBAL__N_…` as the source name of an anonymous namespace.
-        if self.input[from..end].starts_with(b"_GLOBAL__N") {
+        if ident.starts_with(b"_GLOBAL__N") {
             return Some(self.d.push_str("(anonymous namespace)"));
         }
         let start = self.d.buf.len() as u32;
-        self.d.buf.extend_from_slice(&self.input[from..end]);
+        self.d.buf.extend_from_slice(ident);
         Some(Sym::span(start, self.d.buf.len() as u32))
     }
 
@@ -1350,7 +1396,10 @@ impl<'a> Parser<'a> {
         let mut cv_volatile = false;
         let mut cv_restrict = false;
         let mut ref_qual = 0u8;
-        if self.eat(b'H').is_none() {
+        if self.eat(b'H').is_some() {
+            // `H` is not a source-name length, so this cannot be a Rust legacy symbol.
+            self.d.legacy_plain = false;
+        } else {
             if self.eat(b'r').is_some() {
                 cv_restrict = true;
             }
@@ -1365,6 +1414,9 @@ impl<'a> Parser<'a> {
             } else if self.eat(b'O').is_some() {
                 ref_qual = 2;
             }
+            if cv_restrict || cv_volatile || cv_const || ref_qual != 0 {
+                self.d.legacy_plain = false;
+            }
         }
 
         let mut so_far: Option<Sym> = None;
@@ -1375,18 +1427,21 @@ impl<'a> Parser<'a> {
             }
             match self.peek() {
                 Some(b'T') => {
+                    self.d.legacy_plain = false;
                     if so_far.is_some() {
                         return None;
                     }
                     so_far = Some(self.parse_template_param()?);
                 }
                 Some(b'I') => {
+                    self.d.legacy_plain = false;
                     let prefix = so_far?;
                     let (args_start, args_end) = self.parse_template_args(true)?;
                     so_far = Some(self.d.attach_template_args(prefix, args_start, args_end));
                 }
                 Some(b'D') if matches!(self.peek_at(1), Some(b't' | b'T')) => return None,
                 Some(b'S') => {
+                    self.d.legacy_plain = false;
                     let subst = if self.starts_with(b"St") {
                         self.pos += 2;
                         self.d.push_str("std")
@@ -1407,7 +1462,9 @@ impl<'a> Parser<'a> {
             }
             self.d.subs.push(so_far?);
             pushed_last = true;
-            self.eat(b'M');
+            if self.eat(b'M').is_some() {
+                self.d.legacy_plain = false;
+            }
         }
 
         if pushed_last {
@@ -1427,7 +1484,12 @@ impl<'a> Parser<'a> {
 
     fn parse_unqualified(&mut self, scope: Option<Sym>) -> Option<Sym> {
         if self.peek() == Some(b'L') && matches!(self.peek_at(1), Some(b'0'..=b'9')) {
+            // The legacy scan does not skip this `L`.
+            self.d.legacy_plain = false;
             self.pos += 1;
+        }
+        if self.d.legacy_plain && !matches!(self.peek(), Some(b'1'..=b'9')) {
+            self.d.legacy_plain = false;
         }
 
         let mut joined = false;
@@ -1504,6 +1566,8 @@ impl<'a> Parser<'a> {
 
     fn parse_abi_tags(&mut self, mut name: Sym) -> Option<Sym> {
         while self.peek() == Some(b'B') && matches!(self.peek_at(1), Some(b'0'..=b'9')) {
+            // `B` is not a source-name length, so this is not a Rust legacy symbol.
+            self.d.legacy_plain = false;
             self.pos += 1;
             name = self.d.materialize_tail(name);
             self.d.append(b"[abi:");
@@ -2566,6 +2630,53 @@ mod tests {
         assert_eq!(demangle_owned("_ZN3foo3barE.llvm.1234"), None);
         assert_eq!(demangle_owned("__ZN3foo3barE"), None);
         assert_eq!(demangle_owned("ZN3foo3barE"), None);
+        assert_eq!(demangle_owned("_ZN3foo3barE.cold"), None);
+        assert_eq!(demangle_owned("_ZN3fooE.llvm.12G"), None);
+        assert_eq!(demangle_owned("_ZN12_GLOBAL__N_1E"), None);
+        assert_eq!(demangle_owned("_ZN12_GLOBAL__N_13fooE"), None);
+    }
+
+    #[test]
+    fn preserves_rust_legacy_rejection() {
+        let mut demangler = Demangler::new();
+        let cases = [
+            ("_ZN3Foo3barEv", Some("Foo::bar")),
+            ("_ZN3foo3barEv.llvm.1234", Some("foo::bar")),
+            ("_ZN3foo3barEv.cold", Some("foo::bar")),
+            ("__ZN3foo3barEv", Some("foo::bar")),
+            ("_ZNK3Foo3barE", Some("Foo::bar")),
+            ("_ZNR3Foo3barE", Some("Foo::bar &")),
+            ("_ZNH3FooE", Some("Foo")),
+            ("_ZN3Foo3barB3abcE", Some("Foo::bar[abi:abc]")),
+            ("_ZTVN3FooE", Some("{vtable(Foo)}")),
+            ("_ZN6.llvm.E", Some(".llvm.")),
+            ("_ZN6.llvm.EE", Some(".llvm.")),
+            ("_ZN3fooM3barE", Some("foo::bar")),
+            ("_ZNL3fooE", Some("foo")),
+            ("_ZN3fooE@@LLVM_21.1", Some("foo")),
+            ("_ZN3fooEi.llvm.AB", Some("foo")),
+            ("_ZNSt3fooE", Some("std::foo")),
+            ("_ZN3fooC1Ev", Some("foo::foo")),
+            ("_ZN3FooIiE3barEv", Some("Foo<int>::bar")),
+            (
+                "_ZN12_GLOBAL__N_13fooEv",
+                Some("(anonymous namespace)::foo"),
+            ),
+            ("_ZN3fooE.llvm.not.llvm.AB", None),
+            ("_ZN3fooEv.llvm.ZZ.llvm.AB", Some("foo")),
+        ];
+        for (symbol, expected) in cases {
+            assert_eq!(demangler.demangle(symbol), expected, "{symbol}");
+            if super::is_rust_legacy_symbol(symbol) {
+                assert!(expected.is_none(), "{symbol}");
+            }
+        }
+        let utf = format!("_ZN{}föoE", "föo".len());
+        assert_eq!(
+            demangler.demangle(&utf).map(str::to_owned),
+            Some("föo".to_owned())
+        );
+        assert!(!super::is_rust_legacy_symbol(&utf));
     }
     #[test]
     fn limits_argument_pack_depth() {
