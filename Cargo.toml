@@ -7,3 +7,6 @@ description = "A fast Itanium C++ name demangler"
 repository = "https://github.com/lapla-cogito/itanium-demangle"
 readme = "README.md"
 keywords = ["demangle", "itanium"]
+
+[dev-dependencies]
+cpp_demangle = "0.5.1"
