@@ -2501,7 +2501,7 @@ mod tests {
     use super::demangle_owned;
 
     fn expect(mangled: &str, demangled: &str) {
-        assert_eq!(
+        pretty_assertions::assert_eq!(
             demangle_owned(mangled).as_deref(),
             Some(demangled),
             "{mangled}"
@@ -2613,9 +2613,9 @@ mod tests {
         let second = demangler.demangle("_ZN3FooC1Ev").unwrap().to_string();
         assert_eq!(first, "Foo::bar");
         assert_eq!(second, "Foo::Foo");
-        assert_eq!(
-            demangler.demangle("_ZNSt6vectorIS_IiEE4sizeEv"),
-            Some("std::vector<std::vector<int> >::size")
+        expect(
+            "_ZNSt6vectorIS_IiEE4sizeEv",
+            "std::vector<std::vector<int> >::size",
         );
     }
 
@@ -2638,7 +2638,6 @@ mod tests {
 
     #[test]
     fn preserves_rust_legacy_rejection() {
-        let mut demangler = Demangler::new();
         let cases = [
             ("_ZN3Foo3barEv", Some("Foo::bar")),
             ("_ZN3foo3barEv.llvm.1234", Some("foo::bar")),
@@ -2666,16 +2665,17 @@ mod tests {
             ("_ZN3fooEv.llvm.ZZ.llvm.AB", Some("foo")),
         ];
         for (symbol, expected) in cases {
-            assert_eq!(demangler.demangle(symbol), expected, "{symbol}");
+            if let Some(expected) = expected {
+                expect(symbol, expected);
+            } else {
+                assert!(demangle_owned(symbol).is_none(), "{symbol}");
+            }
             if super::is_rust_legacy_symbol(symbol) {
                 assert!(expected.is_none(), "{symbol}");
             }
         }
         let utf = format!("_ZN{}föoE", "föo".len());
-        assert_eq!(
-            demangler.demangle(&utf).map(str::to_owned),
-            Some("föo".to_owned())
-        );
+        expect(&utf, "föo");
         assert!(!super::is_rust_legacy_symbol(&utf));
     }
     #[test]
@@ -2684,7 +2684,7 @@ mod tests {
         let depth = super::MAX_DEPTH as usize * 2;
         let name = format!("_Z1fI{}i{}Evv", "J".repeat(depth), "E".repeat(depth));
         assert!(demangler.demangle(&name).is_none());
-        assert_eq!(demangler.demangle("_Z1fIJiEEvv"), Some("f<int>"));
+        expect("_Z1fIJiEEvv", "f<int>");
     }
 
     #[test]
@@ -2692,10 +2692,7 @@ mod tests {
         let mut demangler = Demangler::new();
         let name = format!("_Z{}1fv", "Th0_".repeat(super::MAX_DEPTH as usize * 2));
         assert!(demangler.demangle(&name).is_none());
-        assert_eq!(
-            demangler.demangle("_ZTh0_1fv"),
-            Some("{virtual override thunk({offset(0)}, f)}")
-        );
+        expect("_ZTh0_1fv", "{virtual override thunk({offset(0)}, f)}");
     }
     #[test]
     fn rejects_out_of_bounds_source_name_lengths() {
@@ -2708,7 +2705,7 @@ mod tests {
         ] {
             assert_eq!(demangler.demangle(&name), None, "{name}");
         }
-        assert_eq!(demangler.demangle("_Z3foo"), Some("foo"));
+        expect("_Z3foo", "foo");
     }
     #[test]
     fn preserves_pointer_declarator_order() {

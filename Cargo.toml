@@ -11,6 +11,7 @@ keywords = ["demangle", "itanium"]
 [dev-dependencies]
 cpp_demangle = "0.5.1"
 criterion = "0.8"
+pretty_assertions = "1.4.1"
 
 [[bench]]
 name = "demangle"
