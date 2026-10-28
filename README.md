@@ -17,6 +17,12 @@ In this crate, `Demangler` writes the display text into one buffer and records s
 
 ## Performance
 
+Run the Criterion benchmarks:
+
+```sh
+cargo bench
+```
+
 Measured on a ThinkPad T14s Gen 7.
 
 The input is the 49,163 unique exported Itanium names (`_Z` / `__Z`) in Ubuntu's `/usr/lib/x86_64-linux-gnu/libLLVM.so.21.1` (LLVM 21.1.8).
