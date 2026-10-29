@@ -17,12 +17,6 @@ In this crate, `Demangler` writes the display text into one buffer and records s
 
 ## Performance
 
-Run the Criterion benchmarks:
-
-```sh
-cargo bench
-```
-
 Measured on a ThinkPad T14s Gen 7.
 
 The input is the 49,163 unique exported Itanium names (`_Z` / `__Z`) in Ubuntu's `/usr/lib/x86_64-linux-gnu/libLLVM.so.21.1` (LLVM 21.1.8).
@@ -34,6 +28,11 @@ One `Demangler` is reused for every name. `cpp_demangle` 0.5.1 is called with `n
 | `itanium-demangle` | 9.2 ms | 187 ns |
 | `cpp_demangle` 0.5.1 | 77.2 ms | 1.57 µs |
 
+Once can run the Criterion benchmark locally for random subset of the libLLVM symbols:
+
+```sh
+cargo bench
+```
 
 [Itanium C++ ABI]: https://itanium-cxx-abi.github.io/cxx-abi/abi.html#mangling
 [cpp_demangle]: https://crates.io/crates/cpp_demangle
