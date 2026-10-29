@@ -28,6 +28,11 @@ One `Demangler` is reused for every name. `cpp_demangle` 0.5.1 is called with `n
 | `itanium-demangle` | 9.2 ms | 187 ns |
 | `cpp_demangle` 0.5.1 | 77.2 ms | 1.57 µs |
 
+Once can run the Criterion benchmark locally for random subset of the libLLVM symbols:
+
+```sh
+cargo bench
+```
 
 [Itanium C++ ABI]: https://itanium-cxx-abi.github.io/cxx-abi/abi.html#mangling
 [cpp_demangle]: https://crates.io/crates/cpp_demangle
