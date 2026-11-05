@@ -3,6 +3,8 @@
 const MAX_DEPTH: u32 = 128;
 /// Absent `Sym::suffix` or `Sym::group`.
 const NO_DECL: u32 = u32::MAX;
+/// Absent `Sym::pack`.
+const NO_PACK: u32 = u32::MAX;
 
 #[derive(Debug)]
 pub struct Demangler {
@@ -15,9 +17,21 @@ pub struct Demangler {
     /// Only the first `template_levels` lists are live.
     template_params: Vec<Vec<Sym>>,
     template_levels: usize,
+    /// Elements of each `J...E` argument pack, in parse order.
+    packs: Vec<Vec<Sym>>,
     depth: u32,
-    /// Inside `J...E`, so a pack expansion does not print another `...`.
+    /// Inside `J...E`. An unexpanded pack expansion prints no extra `...`.
     in_arg_pack: bool,
+    /// `Dp` is reprinting its pattern. Pack parameters resolve to `pack_index`.
+    expanding: bool,
+    pack_index: usize,
+    /// Length of the first pack referenced while `expanding`. `None` if there is none.
+    expand_len: Option<usize>,
+    /// Record substitutions. Later copies of a pack pattern leave this off.
+    record_subs: bool,
+    /// `insert`/`retarget` before this offset sets `prefix_dirty`. Zero disables the check.
+    edit_base: u32,
+    prefix_dirty: bool,
     /// Inside a lambda signature. `T_` there is that lambda's `auto`.
     in_lambda_sig: bool,
     /// Local names and expression literals print parameter lists.
@@ -152,6 +166,10 @@ struct Sym {
     ref_qual: u8,
     /// Ranges name bytes in `Demangler::side` rather than the output buffer.
     side: bool,
+    /// Index into `Demangler::packs` when this text is one template argument pack.
+    pack: u32,
+    /// Pack expansion that produced no elements. List printers skip it.
+    empty_pack: bool,
 }
 
 impl Sym {
@@ -170,6 +188,15 @@ impl Sym {
             cv_restrict: false,
             ref_qual: 0,
             side: false,
+            pack: NO_PACK,
+            empty_pack: false,
+        }
+    }
+
+    fn blank(at: u32) -> Self {
+        Self {
+            empty_pack: true,
+            ..Self::span(at, at)
         }
     }
 
@@ -226,6 +253,31 @@ impl Sym {
     }
 }
 
+struct Snapshot {
+    buf: Vec<u8>,
+    side: Vec<u8>,
+    scratch: Vec<u8>,
+    subs: Vec<Sym>,
+    packs: Vec<Vec<Sym>>,
+    template_params: Vec<Vec<Sym>>,
+    template_levels: usize,
+    depth: u32,
+    in_arg_pack: bool,
+    expanding: bool,
+    pack_index: usize,
+    expand_len: Option<usize>,
+    record_subs: bool,
+    edit_base: u32,
+    prefix_dirty: bool,
+    in_lambda_sig: bool,
+    show_params: bool,
+    type_depth: u32,
+    defer_depth: u32,
+    legacy_plain: bool,
+    legacy_llvm_in_name: bool,
+    legacy_high_bit: bool,
+}
+
 impl Default for Demangler {
     fn default() -> Self {
         Self::new()
@@ -241,8 +293,15 @@ impl Demangler {
             subs: Vec::with_capacity(32),
             template_params: Vec::new(),
             template_levels: 0,
+            packs: Vec::new(),
             depth: 0,
             in_arg_pack: false,
+            expanding: false,
+            pack_index: 0,
+            expand_len: None,
+            record_subs: true,
+            edit_base: 0,
+            prefix_dirty: false,
             in_lambda_sig: false,
             show_params: false,
             defer_depth: 0,
@@ -260,9 +319,16 @@ impl Demangler {
         self.buf.clear();
         self.side.clear();
         self.subs.clear();
+        self.packs.clear();
         self.template_levels = 0;
         self.depth = 0;
         self.in_arg_pack = false;
+        self.expanding = false;
+        self.pack_index = 0;
+        self.expand_len = None;
+        self.record_subs = true;
+        self.edit_base = 0;
+        self.prefix_dirty = false;
         self.in_lambda_sig = false;
         self.show_params = false;
         self.defer_depth = 0;
@@ -327,6 +393,87 @@ impl Demangler {
             .get(self.template_levels.checked_sub(1)?)?
             .get(index)
             .copied()
+    }
+
+    /// Resolve `T_` / `Tn_`. While expanding `Dp`, a pack yields one element.
+    fn resolve_template_arg(&mut self, index: usize) -> Option<Sym> {
+        let sym = self.template_arg(index)?;
+        if !self.expanding || sym.pack == NO_PACK {
+            return Some(sym);
+        }
+        let pack = sym.pack as usize;
+        let len = self.packs.get(pack)?.len();
+        if self.expand_len.is_none() {
+            self.expand_len = Some(len);
+        }
+        if self.expand_len == Some(0) {
+            return Some(Sym::blank(self.buf.len() as u32));
+        }
+        self.packs.get(pack)?.get(self.pack_index).copied()
+    }
+
+    fn push_sub(&mut self, sym: Sym) {
+        if self.record_subs && !sym.empty_pack {
+            self.subs.push(sym);
+        }
+    }
+
+    fn touch_prefix(&mut self, pos: u32) {
+        if pos < self.edit_base {
+            self.prefix_dirty = true;
+        }
+    }
+
+    fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            buf: self.buf.clone(),
+            side: self.side.clone(),
+            scratch: self.scratch.clone(),
+            subs: self.subs.clone(),
+            packs: self.packs.clone(),
+            template_params: self.template_params.clone(),
+            template_levels: self.template_levels,
+            depth: self.depth,
+            in_arg_pack: self.in_arg_pack,
+            expanding: self.expanding,
+            pack_index: self.pack_index,
+            expand_len: self.expand_len,
+            record_subs: self.record_subs,
+            edit_base: self.edit_base,
+            prefix_dirty: self.prefix_dirty,
+            in_lambda_sig: self.in_lambda_sig,
+            show_params: self.show_params,
+            type_depth: self.type_depth,
+            defer_depth: self.defer_depth,
+            legacy_plain: self.legacy_plain,
+            legacy_llvm_in_name: self.legacy_llvm_in_name,
+            legacy_high_bit: self.legacy_high_bit,
+        }
+    }
+
+    fn restore(&mut self, snap: Snapshot) {
+        self.buf = snap.buf;
+        self.side = snap.side;
+        self.scratch = snap.scratch;
+        self.subs = snap.subs;
+        self.packs = snap.packs;
+        self.template_params = snap.template_params;
+        self.template_levels = snap.template_levels;
+        self.depth = snap.depth;
+        self.in_arg_pack = snap.in_arg_pack;
+        self.expanding = snap.expanding;
+        self.pack_index = snap.pack_index;
+        self.expand_len = snap.expand_len;
+        self.record_subs = snap.record_subs;
+        self.edit_base = snap.edit_base;
+        self.prefix_dirty = snap.prefix_dirty;
+        self.in_lambda_sig = snap.in_lambda_sig;
+        self.show_params = snap.show_params;
+        self.type_depth = snap.type_depth;
+        self.defer_depth = snap.defer_depth;
+        self.legacy_plain = snap.legacy_plain;
+        self.legacy_llvm_in_name = snap.legacy_llvm_in_name;
+        self.legacy_high_bit = snap.legacy_high_bit;
     }
 
     fn append(&mut self, bytes: &[u8]) {
@@ -427,6 +574,7 @@ impl Demangler {
             || self.template_params[..self.template_levels]
                 .iter()
                 .any(|level| level.iter().any(hit))
+            || self.packs.iter().any(|pack| pack.iter().any(hit))
     }
 
     fn qualify(&mut self, scope: Sym, leaf: Sym) -> Sym {
@@ -762,6 +910,7 @@ impl Demangler {
 
     /// Point substitutions that referred to `[from, to)` at the copy now starting at `new_start`.
     fn retarget(&mut self, from: u32, to: u32, new_start: u32) {
+        self.touch_prefix(from);
         let delta = new_start as i64 - from as i64;
         if delta == 0 {
             return;
@@ -811,6 +960,7 @@ impl Demangler {
 
     /// Move ranges that lay entirely inside `[from, to)` by `delta`.
     fn shift_contained(&mut self, from: u32, to: u32, delta: u32) {
+        self.touch_prefix(from);
         let shift = |sym: &mut Sym| {
             if !sym.side && sym.start >= from && sym.end <= to {
                 *sym = sym.relocate(sym.start + delta);
@@ -824,9 +974,15 @@ impl Demangler {
                 shift(sym);
             }
         }
+        for pack in &mut self.packs {
+            for sym in pack {
+                shift(sym);
+            }
+        }
     }
 
     fn insert_at(&mut self, pos: u32, bytes: &[u8]) {
+        self.touch_prefix(pos);
         let at = pos as usize;
         let old_len = self.buf.len();
         let extra = bytes.len();
@@ -846,6 +1002,13 @@ impl Demangler {
                 }
             }
         }
+        for pack in &mut self.packs {
+            for sym in pack {
+                if !sym.side {
+                    shift_sym(sym, pos, amount);
+                }
+            }
+        }
     }
 
     /// Keep substitutions that name `[from, to)` by moving that text out of the output buffer.
@@ -853,6 +1016,7 @@ impl Demangler {
         if from >= to {
             return Some(());
         }
+        self.touch_prefix(from);
         let bad = |sym: &Sym| {
             if sym.side {
                 return false;
@@ -867,6 +1031,7 @@ impl Demangler {
             || self.template_params[..self.template_levels]
                 .iter()
                 .any(|level| level.iter().any(bad))
+            || self.packs.iter().any(|pack| pack.iter().any(bad))
         {
             return None;
         }
@@ -886,6 +1051,11 @@ impl Demangler {
         }
         for level in &mut self.template_params[..self.template_levels] {
             for sym in level {
+                shift(sym);
+            }
+        }
+        for pack in &mut self.packs {
+            for sym in pack {
                 shift(sym);
             }
         }
@@ -960,6 +1130,17 @@ impl Demangler {
         self.append(digits.as_bytes());
         Sym::span(start, self.buf.len() as u32)
     }
+}
+
+fn sym_within(sym: Sym, buf_len: usize, side_len: usize) -> bool {
+    let limit = if sym.side { side_len } else { buf_len } as u32;
+    let ok = |idx: u32| idx <= limit;
+    ok(sym.start)
+        && ok(sym.end)
+        && ok(sym.base_start)
+        && ok(sym.base_end)
+        && (sym.suffix == NO_DECL || ok(sym.suffix))
+        && (sym.group == NO_DECL || ok(sym.group))
 }
 
 fn shift_sym(sym: &mut Sym, pos: u32, amount: u32) {
@@ -1376,7 +1557,7 @@ impl<'a> Parser<'a> {
 
         if self.peek() == Some(b'I') {
             if !is_subst {
-                self.d.subs.push(name);
+                self.d.push_sub(name);
             }
             let (args_start, args_end) = self.parse_template_args(true)?;
             name = self.d.attach_template_args(name, args_start, args_end);
@@ -1460,7 +1641,7 @@ impl<'a> Parser<'a> {
                     so_far = Some(self.parse_unqualified(so_far)?);
                 }
             }
-            self.d.subs.push(so_far?);
+            self.d.push_sub(so_far?);
             pushed_last = true;
             if self.eat(b'M').is_some() {
                 self.d.legacy_plain = false;
@@ -1607,15 +1788,24 @@ impl<'a> Parser<'a> {
             if self.peek() == Some(b'Q') {
                 return None;
             }
+            let mark = self.d.buf.len() as u32;
             if !first {
                 self.d.append(b", ");
             }
-            first = false;
             let cursor = self.d.buf.len() as u32;
             let arg = self.parse_template_arg()?;
             let arg = self.d.place_at_cursor(arg, cursor)?;
             // Drop scopes opened while parsing this argument.
             self.d.template_levels = base_level;
+            if arg.empty_pack {
+                // Keep the parameter slot, but do not print an empty expansion.
+                self.d.truncate(mark);
+                if track {
+                    self.d.push_template_arg(Sym::blank(mark))?;
+                }
+                continue;
+            }
+            first = false;
             if track {
                 self.d.push_template_arg(arg)?;
             }
@@ -1649,26 +1839,140 @@ impl<'a> Parser<'a> {
         let start = self.d.buf.len() as u32;
         let saved = self.d.in_arg_pack;
         self.d.in_arg_pack = true;
+        let mut elements = Vec::new();
         let mut first = true;
         while self.peek() != Some(b'E') {
+            let mark = self.d.buf.len() as u32;
             if !first {
                 self.d.append(b", ");
             }
-            first = false;
             let cursor = self.d.buf.len() as u32;
-            let arg = self.parse_template_arg()?;
+            let Some(arg) = self.parse_template_arg() else {
+                self.d.in_arg_pack = saved;
+                return None;
+            };
             let Some(arg) = self.d.place_at_cursor(arg, cursor) else {
                 self.d.in_arg_pack = saved;
                 return None;
             };
+            if arg.empty_pack {
+                self.d.truncate(mark);
+                continue;
+            }
             if arg.end as usize != self.d.buf.len() {
                 self.d.in_arg_pack = saved;
                 return None;
             }
+            first = false;
+            elements.push(arg);
         }
         self.d.in_arg_pack = saved;
         self.eat(b'E')?;
+        let pack_id = u32::try_from(self.d.packs.len()).ok()?;
+        self.d.packs.push(elements);
+        let mut sym = Sym::span(start, self.d.buf.len() as u32);
+        sym.pack = pack_id;
+        Some(sym)
+    }
+
+    /// `<type> ::= Dp <type>`. Reprint the pattern once per pack element.
+    fn parse_pack_expansion(&mut self) -> Option<Sym> {
+        self.pos += 2;
+        let pattern = self.pos;
+        let outer_expanding = self.d.expanding;
+        let outer_index = self.d.pack_index;
+        let outer_record = self.d.record_subs;
+        let outer_len = self.d.expand_len;
+
+        let snap = self.d.snapshot();
+        self.d.expand_len = None;
+        self.d.expanding = true;
+        self.d.pack_index = 0;
+        self.d.record_subs = false;
+        let trial = self.parse_type();
+        let discovered = self.d.expand_len;
+        self.d.restore(snap);
+        self.pos = pattern;
+        trial?;
+
+        let sym = if let Some(len) = discovered {
+            if len == 0 {
+                self.consume_empty_expansion(pattern)?
+            } else {
+                self.expand_pack(pattern, len)?
+            }
+        } else {
+            let inner = self.parse_type()?;
+            if self.d.in_arg_pack || inner.empty_pack {
+                inner
+            } else {
+                self.d.append_suffix(inner, "...")
+            }
+        };
+        self.d.expanding = outer_expanding;
+        self.d.pack_index = outer_index;
+        self.d.record_subs = outer_record;
+        self.d.expand_len = outer_len;
+        Some(sym)
+    }
+
+    fn expand_pack(&mut self, pattern: usize, len: usize) -> Option<Sym> {
+        let allow_subs = self.d.record_subs;
+        let start = self.d.buf.len() as u32;
+        for index in 0..len {
+            if index > 0 {
+                self.d.append(b", ");
+            }
+            self.pos = pattern;
+            self.d.expanding = true;
+            self.d.pack_index = index;
+            self.d.expand_len = None;
+            self.d.record_subs = allow_subs && index == 0;
+            let cursor = self.d.buf.len() as u32;
+            let sym = self.parse_type()?;
+            self.d.place_at_cursor(sym, cursor)?;
+        }
+        self.d.record_subs = allow_subs;
+        self.d.expanding = false;
         Some(Sym::span(start, self.d.buf.len() as u32))
+    }
+
+    /// Parse the pattern so the cursor advances, then drop the text an empty pack prints.
+    fn consume_empty_expansion(&mut self, pattern: usize) -> Option<Sym> {
+        self.pos = pattern;
+        let snap = self.d.snapshot();
+        let base = self.d.buf.len();
+        let subs_base = self.d.subs.len();
+        let side_base = self.d.side.len();
+        let packs_base = self.d.packs.len();
+        self.d.edit_base = base as u32;
+        self.d.prefix_dirty = false;
+        self.d.expanding = true;
+        self.d.pack_index = 0;
+        self.d.expand_len = None;
+        let parsed = self.parse_type();
+        let dirty = self.d.prefix_dirty;
+        if parsed.is_none() || dirty {
+            self.d.restore(snap);
+            self.pos = pattern;
+            return None;
+        }
+        self.d.edit_base = 0;
+        self.d.prefix_dirty = false;
+        self.d.expanding = false;
+        self.d.buf.truncate(base);
+        self.d.side.truncate(side_base);
+        self.d.packs.truncate(packs_base);
+        if self.d.subs.len() > subs_base {
+            let kept: Vec<Sym> = self.d.subs[subs_base..]
+                .iter()
+                .copied()
+                .filter(|sym| sym_within(*sym, base, side_base))
+                .collect();
+            self.d.subs.truncate(subs_base);
+            self.d.subs.extend(kept);
+        }
+        Some(Sym::blank(base as u32))
     }
 
     fn parse_lambda(&mut self) -> Option<Sym> {
@@ -1705,12 +2009,17 @@ impl<'a> Parser<'a> {
         } else {
             let mut first = true;
             while self.peek() != Some(b'E') {
+                let mark = self.d.buf.len() as u32;
                 if !first {
                     self.d.append(b", ");
                 }
-                first = false;
                 let cursor = self.d.buf.len() as u32;
                 let ty = self.parse_type()?;
+                if ty.empty_pack {
+                    self.d.truncate(mark);
+                    continue;
+                }
+                first = false;
                 self.d.place_at_cursor(ty, cursor)?;
             }
         }
@@ -1771,7 +2080,8 @@ impl<'a> Parser<'a> {
             let mut ok = Some(());
             while !self.at_encoding_end() {
                 match self.parse_type() {
-                    Some(ty) => params.push(ty),
+                    Some(ty) if !ty.empty_pack => params.push(ty),
+                    Some(_) => {}
                     None => {
                         ok = None;
                         break;
@@ -1863,7 +2173,7 @@ impl<'a> Parser<'a> {
         if self.d.in_lambda_sig {
             return Some(self.d.push_str("auto"));
         }
-        self.d.template_arg(index)
+        self.d.resolve_template_arg(index)
     }
 
     fn parse_substitution(&mut self) -> Option<Sym> {
@@ -1998,14 +2308,10 @@ impl<'a> Parser<'a> {
                 Some(self.push_builtin("..."))
             }
             b'D' if self.peek_at(1) == Some(b'p') => {
-                self.pos += 2;
-                let inner = self.parse_type()?;
-                let sym = if self.d.in_arg_pack {
-                    inner
-                } else {
-                    self.d.append_suffix(inner, "...")
-                };
-                self.d.subs.push(sym);
+                let sym = self.parse_pack_expansion()?;
+                if !sym.empty_pack {
+                    self.d.push_sub(sym);
+                }
                 Some(sym)
             }
             b'D' => self.parse_d_type(),
@@ -2015,17 +2321,17 @@ impl<'a> Parser<'a> {
                 if self.peek() == Some(b'I') {
                     return None;
                 }
-                self.d.subs.push(name);
+                self.d.push_sub(name);
                 Some(name)
             }
             b'A' => {
                 let sym = self.parse_array_type()?;
-                self.d.subs.push(sym);
+                self.d.push_sub(sym);
                 Some(sym)
             }
             b'F' => {
                 let sym = self.parse_function_type(false, false, false)?;
-                self.d.subs.push(sym);
+                self.d.push_sub(sym);
                 Some(sym)
             }
             b'M' => {
@@ -2033,28 +2339,28 @@ impl<'a> Parser<'a> {
                 let class_ty = self.parse_type()?;
                 let member = self.parse_type()?;
                 let sym = self.d.wrap_member_pointer(class_ty, member)?;
-                self.d.subs.push(sym);
+                self.d.push_sub(sym);
                 Some(sym)
             }
             b'P' => {
                 self.pos += 1;
                 let inner = self.parse_type()?;
                 let sym = self.d.wrap_pointer(inner, b'*')?;
-                self.d.subs.push(sym);
+                self.d.push_sub(sym);
                 Some(sym)
             }
             b'R' => {
                 self.pos += 1;
                 let inner = self.parse_type()?;
                 let sym = self.d.wrap_pointer(inner, b'&')?;
-                self.d.subs.push(sym);
+                self.d.push_sub(sym);
                 Some(sym)
             }
             b'O' => {
                 self.pos += 1;
                 let inner = self.parse_type()?;
                 let sym = self.d.wrap_pointer(inner, b'O')?;
-                self.d.subs.push(sym);
+                self.d.push_sub(sym);
                 Some(sym)
             }
             b'K' | b'V' | b'r' | b'U' => self.parse_qualified_type(),
@@ -2064,13 +2370,13 @@ impl<'a> Parser<'a> {
                 }
                 let param = self.parse_template_param()?;
                 if self.peek() == Some(b'I') {
-                    self.d.subs.push(param);
+                    self.d.push_sub(param);
                     let (args_start, args_end) = self.parse_template_args(false)?;
                     let sym = self.d.attach_template_args(param, args_start, args_end);
-                    self.d.subs.push(sym);
+                    self.d.push_sub(sym);
                     Some(sym)
                 } else {
-                    self.d.subs.push(param);
+                    self.d.push_sub(param);
                     Some(param)
                 }
             }
@@ -2085,22 +2391,22 @@ impl<'a> Parser<'a> {
                 };
                 if self.peek() == Some(b'I') {
                     if !is_subst {
-                        self.d.subs.push(name);
+                        self.d.push_sub(name);
                     }
                     let (args_start, args_end) = self.parse_template_args(false)?;
                     let sym = self.d.attach_template_args(name, args_start, args_end);
-                    self.d.subs.push(sym);
+                    self.d.push_sub(sym);
                     Some(sym)
                 } else if is_subst {
                     Some(name)
                 } else {
-                    self.d.subs.push(name);
+                    self.d.push_sub(name);
                     Some(name)
                 }
             }
             _ => {
                 let name = self.parse_name()?;
-                self.d.subs.push(name);
+                self.d.push_sub(name);
                 Some(name)
             }
         }
@@ -2145,7 +2451,7 @@ impl<'a> Parser<'a> {
         }
         if self.peek() == Some(b'F') {
             let sym = self.parse_function_type(const_qual, volatile_qual, restrict_qual)?;
-            self.d.subs.push(sym);
+            self.d.push_sub(sym);
             return Some(sym);
         }
         let inner = self.parse_type()?;
@@ -2161,7 +2467,7 @@ impl<'a> Parser<'a> {
             (false, false, false) => return None,
         };
         let sym = self.d.wrap_cv(inner, text)?;
-        self.d.subs.push(sym);
+        self.d.push_sub(sym);
         Some(sym)
     }
 
@@ -2179,7 +2485,7 @@ impl<'a> Parser<'a> {
             return None;
         };
         let sym = self.prefixed(kind, true)?;
-        self.d.subs.push(sym);
+        self.d.push_sub(sym);
         Some(sym)
     }
 
@@ -2311,12 +2617,17 @@ impl<'a> Parser<'a> {
                 if matches!(self.peek(), Some(b'R' | b'O')) && self.peek_at(1) == Some(b'E') {
                     break;
                 }
+                let mark = self.d.buf.len() as u32;
                 if !first {
                     self.d.append(b", ");
                 }
-                first = false;
                 let cursor = self.d.buf.len() as u32;
                 let param = self.parse_type()?;
+                if param.empty_pack {
+                    self.d.truncate(mark);
+                    continue;
+                }
+                first = false;
                 self.d.place_at_cursor(param, cursor)?;
             }
         }
@@ -2685,6 +2996,34 @@ mod tests {
         let name = format!("_Z1fI{}i{}Evv", "J".repeat(depth), "E".repeat(depth));
         assert!(demangler.demangle(&name).is_none());
         expect("_Z1fIJiEEvv", "f<int>");
+    }
+
+    #[test]
+    fn expands_parameter_packs() {
+        expect("_ZZ1fIJicEEvDpT_E1x", "f<int, char>(int, char)::x");
+        expect("_ZZ1fIJiEEvDpT_E1x", "f<int>(int)::x");
+        expect("_ZZ1fIJEEvDpT_E1x", "f<>()::x");
+        expect("_ZZ1gIJicEEvDpPT_E1x", "g<int, char>(int*, char*)::x");
+        expect("_ZZ1gIJicEEvDpOT_E1x", "g<int, char>(int&&, char&&)::x");
+        expect("_ZZ1gIJEEvDpPT_E1x", "g<>()::x");
+        expect("_ZZ1hIJicEEv1AIJDpT_EEE1x", "h<int, char>(A<int, char>)::x");
+        expect("_ZZ1hIJEEv1AIJDpT_EEE1x", "h<>(A<>)::x");
+        expect(
+            "_ZZ1kIJicEEv1AIJDpPT_EEE1x",
+            "k<int, char>(A<int*, char*>)::x",
+        );
+        expect("_ZZ1kIJEEv1AIJDpPT_EEE1x", "k<>(A<>)::x");
+        expect("_ZZ1mIJicEEvDpT_iE1x", "m<int, char>(int, char, int)::x");
+        expect("_ZZ1mIJEEvDpT_iE1x", "m<>(int)::x");
+        expect("_ZZ1nIJicEEviDpT_E1x", "n<int, char>(int, int, char)::x");
+        expect("_ZZ1nIJEEviDpT_E1x", "n<>(int)::x");
+        expect("_ZZ1fIJicEEv1AIDpT_EE1x", "f<int, char>(A<int, char>)::x");
+        expect("_ZZ1fIiEvDpiE1x", "f<int>(int...)::x");
+        expect(
+            "_ZZ1fIJicEEvDpRKT_E1x",
+            "f<int, char>(int const&, char const&)::x",
+        );
+        expect("_ZN3Foo5applyIJ3Bar3BazEEEv", "Foo::apply<Bar, Baz>");
     }
 
     #[test]
