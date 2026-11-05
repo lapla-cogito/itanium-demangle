@@ -1062,6 +1062,23 @@ impl Demangler {
         Some(())
     }
 
+    /// Move the tail `[start, buf.len())` into the side buffer and drop it from the output.
+    fn detach_tail(&mut self, start: u32) -> Option<Sym> {
+        let end = self.buf.len() as u32;
+        if start > end {
+            return None;
+        }
+        if start == end {
+            return Some(Sym::span(start, end));
+        }
+        let side_at = self.side.len() as u32;
+        self.evict_junk(start, end)?;
+        self.truncate(start);
+        let mut sym = Sym::span(side_at, side_at + (end - start));
+        sym.side = true;
+        Some(sym)
+    }
+
     fn truncate(&mut self, pos: u32) {
         self.buf.truncate(pos as usize);
     }
@@ -1315,6 +1332,16 @@ struct Expr {
     sym: Sym,
     /// When this expression is a subexpression, wrap it in parentheses.
     paren: bool,
+}
+
+/// Exception specification parsed before `F`. Its text is printed after `)`.
+enum ExceptionSuffix {
+    Absent,
+    Noexcept,
+    /// `noexcept(<expression>)`. `Sym` lives in the side buffer.
+    Expr(Sym),
+    /// `throw(<types>)`. `Sym` lives in the side buffer.
+    Throw(Sym),
 }
 
 enum Glue<'a> {
@@ -2314,6 +2341,11 @@ impl<'a> Parser<'a> {
                 }
                 Some(sym)
             }
+            b'D' if self.function_prefix() => {
+                let sym = self.parse_prefixed_function(false, false, false)?;
+                self.d.push_sub(sym);
+                Some(sym)
+            }
             b'D' => self.parse_d_type(),
             b'u' => {
                 self.pos += 1;
@@ -2330,7 +2362,7 @@ impl<'a> Parser<'a> {
                 Some(sym)
             }
             b'F' => {
-                let sym = self.parse_function_type(false, false, false)?;
+                let sym = self.parse_prefixed_function(false, false, false)?;
                 self.d.push_sub(sym);
                 Some(sym)
             }
@@ -2449,8 +2481,8 @@ impl<'a> Parser<'a> {
         if !const_qual && !volatile_qual && !restrict_qual {
             return None;
         }
-        if self.peek() == Some(b'F') {
-            let sym = self.parse_function_type(const_qual, volatile_qual, restrict_qual)?;
+        if self.function_prefix() {
+            let sym = self.parse_prefixed_function(const_qual, volatile_qual, restrict_qual)?;
             self.d.push_sub(sym);
             return Some(sym);
         }
@@ -2589,11 +2621,91 @@ impl<'a> Parser<'a> {
         self.d.wrap_array(element, dim)
     }
 
+    /// `F`, or an exception specification / `transaction_safe` that must be followed by `F`.
+    fn function_prefix(&self) -> bool {
+        self.peek() == Some(b'F')
+            || self.starts_with(b"Do")
+            || self.starts_with(b"DO")
+            || self.starts_with(b"Dw")
+            || self.starts_with(b"Dx")
+    }
+
+    fn parse_prefixed_function(
+        &mut self,
+        const_qual: bool,
+        volatile_qual: bool,
+        restrict_qual: bool,
+    ) -> Option<Sym> {
+        let exception = self.parse_exception_suffix()?;
+        let transaction_safe = if self.starts_with(b"Dx") {
+            self.pos += 2;
+            true
+        } else {
+            false
+        };
+        self.parse_function_type(
+            const_qual,
+            volatile_qual,
+            restrict_qual,
+            transaction_safe,
+            exception,
+        )
+    }
+
+    fn parse_exception_suffix(&mut self) -> Option<ExceptionSuffix> {
+        let kind = match (self.peek(), self.peek_at(1)) {
+            (Some(b'D'), Some(b'o')) => b'o',
+            (Some(b'D'), Some(b'O')) => b'O',
+            (Some(b'D'), Some(b'w')) => b'w',
+            _ => return Some(ExceptionSuffix::Absent),
+        };
+        self.pos += 2;
+        match kind {
+            b'o' => Some(ExceptionSuffix::Noexcept),
+            b'O' => {
+                let start = self.d.buf.len() as u32;
+                let expr = self.parse_expression()?;
+                self.eat(b'E')?;
+                let expr = self.d.place_at_cursor(expr, start)?;
+                if expr.start != start || expr.end as usize != self.d.buf.len() {
+                    return None;
+                }
+                Some(ExceptionSuffix::Expr(self.d.detach_tail(start)?))
+            }
+            b'w' => {
+                let start = self.d.buf.len() as u32;
+                let mut first = true;
+                while self.peek().is_some_and(|byte| byte != b'E') {
+                    let mark = self.d.buf.len() as u32;
+                    if !first {
+                        self.d.append(b", ");
+                    }
+                    let cursor = self.d.buf.len() as u32;
+                    let ty = self.parse_type()?;
+                    if ty.empty_pack {
+                        self.d.truncate(mark);
+                        continue;
+                    }
+                    first = false;
+                    self.d.place_at_cursor(ty, cursor)?;
+                }
+                if first {
+                    return None;
+                }
+                self.eat(b'E')?;
+                Some(ExceptionSuffix::Throw(self.d.detach_tail(start)?))
+            }
+            _ => None,
+        }
+    }
+
     fn parse_function_type(
         &mut self,
         const_qual: bool,
         volatile_qual: bool,
         restrict_qual: bool,
+        transaction_safe: bool,
+        exception: ExceptionSuffix,
     ) -> Option<Sym> {
         self.eat(b'F')?;
         if self.peek() == Some(b'Y') {
@@ -2609,7 +2721,11 @@ impl<'a> Parser<'a> {
         }
         self.d.append(b" (");
         let suffix = self.d.buf.len() as u32 - 1;
-        if self.peek() == Some(b'v') && self.peek_at(1) == Some(b'E') {
+        // A lone `v` is an empty parameter list, including before a ref-qualifier.
+        let empty_params = self.peek() == Some(b'v')
+            && (self.peek_at(1) == Some(b'E')
+                || (matches!(self.peek_at(1), Some(b'R' | b'O')) && self.peek_at(2) == Some(b'E')));
+        if empty_params {
             self.pos += 1;
         } else {
             let mut first = true;
@@ -2642,6 +2758,23 @@ impl<'a> Parser<'a> {
         };
         self.eat(b'E')?;
         self.d.append(b")");
+        if transaction_safe {
+            self.d.append(b" transaction_safe");
+        }
+        match exception {
+            ExceptionSuffix::Absent => {}
+            ExceptionSuffix::Noexcept => self.d.append(b" noexcept"),
+            ExceptionSuffix::Expr(expr) => {
+                self.d.append(b" noexcept(");
+                self.d.append_range(expr);
+                self.d.append(b")");
+            }
+            ExceptionSuffix::Throw(types) => {
+                self.d.append(b" throw(");
+                self.d.append_range(types);
+                self.d.append(b")");
+            }
+        }
         if const_qual {
             self.d.append(b" const");
         }
@@ -3091,6 +3224,28 @@ mod tests {
             "f<Foo::Bar, Foo::Bar<int>::Baz, Foo::Bar<int>::Baz const&>",
         );
     }
+    #[test]
+    fn prints_exception_specifications() {
+        expect(
+            "_ZN4llvm8erase_ifINSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEEPDoFiiEEEvRT_T0_",
+            "llvm::erase_if<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, int (*)(int) noexcept>",
+        );
+        expect("_Z1fIPDoFiiEE", "f<int (*)(int) noexcept>");
+        expect("_ZZ1fPDoFiiEE1x", "f(int (*)(int) noexcept)::x");
+        expect("_Z1fIPDOLb1EEFiiEE", "f<int (*)(int) noexcept(true)>");
+        expect("_ZZ1fPDOLb1EEFiiEE1x", "f(int (*)(int) noexcept(true))::x");
+        expect("_Z1fIPDwiEFvvEE", "f<void (*)() throw(int)>");
+        expect("_Z1fIPDwiiEFvvEE", "f<void (*)() throw(int, int)>");
+        expect("_Z1fIKDoFvvEE", "f<void () noexcept const>");
+        expect("_Z1fIM3FooKDoFvvEE", "f<void (Foo::*)() noexcept const>");
+        expect("_Z1fIM3FooKDoFvvREE", "f<void (Foo::*)() noexcept const &>");
+        expect("_Z1fIPDoFvvREE", "f<void (*)() noexcept &>");
+        expect("_Z1fIRDoFvvEE", "f<void (&)() noexcept>");
+        expect("_Z1fIPKDwiEFvvEE", "f<void (*)() throw(int) const>");
+        expect("_Z1fIPDxFvvEE", "f<void (*)() transaction_safe>");
+        expect("_Z1fIPDoDxFvvEE", "f<void (*)() transaction_safe noexcept>");
+    }
+
     #[test]
     fn keeps_qualifiers_on_member_function_types() {
         expect("_Z1fIJM1DKFvN1N1TEEEEvv", "f<void (D::*)(N::T) const>");
