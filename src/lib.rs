@@ -1683,7 +1683,7 @@ impl<'a> Parser<'a> {
         name.cv_volatile = cv_volatile;
         name.cv_restrict = cv_restrict;
         name.ref_qual = ref_qual;
-        if defer_this {
+        if defer_this || (ref_qual == 0 && !cv_const && !cv_volatile && !cv_restrict) {
             Some(name)
         } else {
             Some(self.d.apply_name_qualifiers(name))
@@ -1702,21 +1702,22 @@ impl<'a> Parser<'a> {
 
         let mut joined = false;
         let leaf = if matches!(self.peek(), Some(b'1'..=b'9')) {
-            joined = if let Some(scope) = scope {
-                !scope.side && scope.end as usize == self.d.buf.len()
-            } else {
-                false
-            };
-            if joined {
+            if let Some(scope) = scope {
+                let start = if !scope.side && scope.end as usize == self.d.buf.len() {
+                    scope.start
+                } else {
+                    let start = self.d.buf.len() as u32;
+                    self.d.append_range(scope);
+                    start
+                };
                 self.d.append(b"::");
-            }
-            let name = self.parse_source_name()?;
-            let name = self.parse_abi_tags(name)?;
-            if joined {
-                let scope = scope?;
-                name.as_name(scope.start, name.end, name.base_start, name.base_end)
+                let name = self.parse_source_name()?;
+                let name = self.with_abi_tags(name)?;
+                joined = true;
+                name.as_name(start, name.end, name.base_start, name.base_end)
             } else {
-                name
+                let name = self.parse_source_name()?;
+                self.with_abi_tags(name)?
             }
         } else if self.starts_with(b"Ut") {
             self.pos += 2;
@@ -1729,17 +1730,17 @@ impl<'a> Parser<'a> {
             let index = number.checked_add(1)?;
             let rendered = format!("{{unnamed type#{index}}}");
             let name = self.d.push_str(&rendered);
-            self.parse_abi_tags(name)?
+            self.with_abi_tags(name)?
         } else if self.starts_with(b"Ul") {
             let name = self.parse_lambda()?;
-            self.parse_abi_tags(name)?
+            self.with_abi_tags(name)?
         } else if matches!(self.peek(), Some(b'C' | b'D')) {
             let scope = scope?;
             let name = self.parse_ctor_dtor(scope)?;
-            return self.parse_abi_tags(name);
+            return self.with_abi_tags(name);
         } else if self.looks_like_operator() {
             let name = self.parse_operator_name()?;
-            self.parse_abi_tags(name)?
+            self.with_abi_tags(name)?
         } else {
             return None;
         };
@@ -1770,6 +1771,15 @@ impl<'a> Parser<'a> {
             return Some(self.d.qualify_ctor(scope, true));
         }
         None
+    }
+
+    #[inline(always)]
+    fn with_abi_tags(&mut self, name: Sym) -> Option<Sym> {
+        if self.peek() == Some(b'B') {
+            self.parse_abi_tags(name)
+        } else {
+            Some(name)
+        }
     }
 
     fn parse_abi_tags(&mut self, mut name: Sym) -> Option<Sym> {
